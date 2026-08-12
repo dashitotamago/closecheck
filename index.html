@@ -20,7 +20,6 @@
 <div id="boot-error"><h2>読み込みエラー</h2><div id="boot-error-text"></div></div>
 
 <script>
-// どこで何が失敗しても、この画面にエラー内容を表示する(真っ白のまま止まらないようにするため)
 window.addEventListener('error', function (e) {
   var box = document.getElementById('boot-error');
   var text = document.getElementById('boot-error-text');
@@ -37,7 +36,6 @@ window.addEventListener('unhandledrejection', function (e) {
     text.textContent += '未処理のPromiseエラー: ' + (e.reason && e.reason.message ? e.reason.message : String(e.reason)) + '\n\n';
   }
 });
-// 15秒経ってもアプリが何も表示していなければ、その旨を出す
 setTimeout(function () {
   var root = document.getElementById('root');
   if (root && root.innerHTML.trim() === '') {
@@ -45,7 +43,7 @@ setTimeout(function () {
     var text = document.getElementById('boot-error-text');
     if (box && text && text.textContent.trim() === '') {
       box.style.display = 'block';
-      text.textContent = '15秒経っても画面が表示されませんでした。JavaScript自体は動いているが、何らかの理由で描画が止まっている可能性があります。';
+      text.textContent = '15秒経っても画面が表示されませんでした。';
     }
   }
 }, 15000);
@@ -190,6 +188,7 @@ const TRACKED_PRODUCTS = ["コーヒー", "牛乳"];
 const BREAD_INGREDIENT_PRODUCTS = ["卵サンド", "サーモン", "牛しぐれ", "うなぎ", "明太子"];
 const SLICES_PER_LOAF = 18;
 const AVG_WINDOW_DAYS = 14;
+
 // デプロイしたGASウェブアプリのURL(.../exec で終わるもの)をここに貼り付けてください
 const GAS_SHEET_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbyMkOjuRbRunsrRpwydC-QVDHFLV_iPsrLD4bRsU8OV6XeZ-tHX3-w93Jt6CO5N9CoV/exec";
 
@@ -210,16 +209,19 @@ async function fetchWithTimeout(url, options, timeoutMs) {
 }
 
 // Googleスプレッドシート(GAS)を保存先として使うための共通関数
-// window.storage.get/set と互換の形({value}を返す/nullを返す)にしてある
 async function storageGet(key) {
-  const res = await fetchWithTimeout(GAS_SHEET_WEBAPP_URL, {
-    method: "POST",
-    headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify({ action: "get", key }),
-  });
-  const json = await res.json();
-  if (!json || !json.ok || json.value === null || json.value === undefined) return null;
-  return { value: json.value };
+  try {
+    const res = await fetchWithTimeout(GAS_SHEET_WEBAPP_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ action: "get", key }),
+    });
+    const json = await res.json();
+    if (!json || !json.ok || json.value === null || json.value === undefined) return null;
+    return { value: json.value };
+  } catch (e) {
+    return null;
+  }
 }
 
 async function storageSet(key, value) {
@@ -231,23 +233,31 @@ async function storageSet(key, value) {
   return res.json();
 }
 
-// 複数キーを1回の通信でまとめて取得(サーバー往復を減らして高速化するため)
-// 戻り値: { key: {value} | null } のオブジェクト
+// 指定したprefixに一致する、実際に存在するキー一覧を取得
+async function storageListKeys(prefix) {
+  try {
+    const res = await fetchWithTimeout(GAS_SHEET_WEBAPP_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ action: "list", prefix }),
+    });
+    const json = await res.json();
+    if (!json || !json.ok) return null;
+    return json.keys || [];
+  } catch (e) {
+    return null;
+  }
+}
+
+// 複数キーをまとめて取得(並列に取得することで高速化)
 async function storageGetMany(keys) {
   if (!keys || keys.length === 0) return {};
-  const res = await fetchWithTimeout(GAS_SHEET_WEBAPP_URL, {
-    method: "POST",
-    headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify({ action: "getMany", keys }),
-  });
-  const json = await res.json();
   const out = {};
-  if (json && json.ok && json.values) {
-    Object.keys(json.values).forEach((k) => {
-      const v = json.values[k];
-      out[k] = v === null || v === undefined ? null : { value: v };
-    });
-  }
+  await Promise.all(
+    keys.map(async (k) => {
+      out[k] = await storageGet(k);
+    })
+  );
   return out;
 }
 const MIGRATION_WINDOW_DAYS = 31;
@@ -295,8 +305,6 @@ function DailyCashReport() {
   const [products, setProducts] = useState([{ name: "だし巻き卵サンド", qty: "" }]);
   const [trackedHistory, setTrackedHistory] = useState([]);
   const [hasSavedToday, setHasSavedToday] = useState(false);
-  const [sheetSyncStatus, setSheetSyncStatus] = useState(""); // "" | "sending" | "success" | "error"
-  const [sheetSyncError, setSheetSyncError] = useState("");
   const markDirty = () => setHasSavedToday(false);
 
   const [ocrLoading, setOcrLoading] = useState(""); // "" | "products"
@@ -309,8 +317,16 @@ function DailyCashReport() {
   const [migrationError, setMigrationError] = useState("");
   const [migrationBusy, setMigrationBusy] = useState(false);
   const [exportFlash, setExportFlash] = useState(false);
+  const [exportedText, setExportedText] = useState("");
 
   const [monthlyPastTotal, setMonthlyPastTotal] = useState(0);
+  const [showSheetPaste, setShowSheetPaste] = useState(false);
+  const [sheetPasteStart, setSheetPasteStart] = useState(() => offsetDateStr(todayStr(), -6));
+  const [sheetPasteEnd, setSheetPasteEnd] = useState(() => todayStr());
+  const [sheetPasteText, setSheetPasteText] = useState("");
+  const [sheetPasteBusy, setSheetPasteBusy] = useState(false);
+  const [sheetPasteFlash, setSheetPasteFlash] = useState(false);
+  const [sheetPasteNotice, setSheetPasteNotice] = useState("");
   const [monthlyPastDays, setMonthlyPastDays] = useState(0);
 
   const fileToResizedBase64 = (file, maxDim = 1600, quality = 0.85) =>
@@ -540,7 +556,15 @@ function DailyCashReport() {
       for (let i = 1; i < AVG_WINDOW_DAYS; i++) {
         dateList.push(offsetDateStr(date, -i));
       }
-      const keys = dateList.map((ds) => `report:${ds}`);
+
+      const existingKeys = await storageListKeys("report:");
+      let targetDates = dateList;
+      if (existingKeys !== null) {
+        const existingSet = new Set(existingKeys);
+        targetDates = dateList.filter((ds) => existingSet.has(`report:${ds}`));
+      }
+
+      const keys = targetDates.map((ds) => `report:${ds}`);
       let results = {};
       try {
         results = await storageGetMany(keys);
@@ -549,7 +573,7 @@ function DailyCashReport() {
       }
 
       const items = [];
-      dateList.forEach((ds, idx) => {
+      targetDates.forEach((ds) => {
         const r = results[`report:${ds}`];
         if (!r) return;
         try {
@@ -565,7 +589,7 @@ function DailyCashReport() {
           );
           items.push({
             date: ds,
-            daysAgo: idx + 1,
+            daysAgo: Math.round((new Date(date) - new Date(ds)) / 86400000),
             isWeekend: isWeekendOrHoliday(ds),
             コーヒー: findQty("コーヒー"),
             牛乳: findQty("牛乳"),
@@ -588,7 +612,15 @@ function DailyCashReport() {
       for (let i = 1; i < dayOfMonth; i++) {
         dateList.push(offsetDateStr(date, -i));
       }
-      const keys = dateList.map((ds) => `report:${ds}`);
+
+      const existingKeys = await storageListKeys("report:");
+      let targetDates = dateList;
+      if (existingKeys !== null) {
+        const existingSet = new Set(existingKeys);
+        targetDates = dateList.filter((ds) => existingSet.has(`report:${ds}`));
+      }
+
+      const keys = targetDates.map((ds) => `report:${ds}`);
       let results = {};
       try {
         results = await storageGetMany(keys);
@@ -598,7 +630,7 @@ function DailyCashReport() {
 
       let total = 0;
       let count = 0;
-      dateList.forEach((ds) => {
+      targetDates.forEach((ds) => {
         const r = results[`report:${ds}`];
         if (!r) return;
         try {
@@ -741,48 +773,11 @@ function DailyCashReport() {
         setSavedFlash(true);
         setHasSavedToday(true);
         setTimeout(() => setSavedFlash(false), 2000);
-
-        // Googleスプレッドシートへ送信(失敗しても保存自体は成功扱いにする)
-        if (GAS_SHEET_WEBAPP_URL && GAS_SHEET_WEBAPP_URL !== "PASTE_YOUR_DEPLOYMENT_URL_HERE") {
-          setSheetSyncStatus("sending");
-          setSheetSyncError("");
-          fetch(GAS_SHEET_WEBAPP_URL, {
-            method: "POST",
-            headers: { "Content-Type": "text/plain;charset=utf-8" },
-            body: JSON.stringify({
-              action: "syncSheet",
-              date,
-              totalSales,
-              grossProfit: num(grossProfit),
-            }),
-          })
-            .then(async (res) => {
-              const rawText = await res.text();
-              if (!res.ok) {
-                throw new Error(`HTTPエラー(${res.status}) ${rawText.slice(0, 150)}`);
-              }
-              let json;
-              try {
-                json = JSON.parse(rawText);
-              } catch (parseErr) {
-                throw new Error(
-                  "応答がJSONではありません(ログイン画面が返っている可能性があります): " +
-                    rawText.slice(0, 150)
-                );
-              }
-              if (!json || !json.ok) {
-                throw new Error((json && json.error) || "GAS側でエラーが返されました");
-              }
-              setSheetSyncStatus("success");
-              setTimeout(() => setSheetSyncStatus(""), 3000);
-            })
-            .catch((err) => {
-              setSheetSyncStatus("error");
-              setSheetSyncError(err && err.message ? err.message : "不明なエラー");
-            });
-        }
       } catch (e) {
-        setError("保存に失敗しました。もう一度お試しください。");
+        setError(
+          "保存に失敗しました。もう一度お試しください。" +
+            (e && e.message ? `(${e.message})` : "")
+        );
       } finally {
         setSaving(false);
       }
@@ -853,7 +848,11 @@ function DailyCashReport() {
   const copyReportText = async () => {
     const text = buildReportText();
     try {
-      await navigator.clipboard.writeText(text);
+      const writePromise = navigator.clipboard.writeText(text);
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("clipboard timeout")), 4000)
+      );
+      await Promise.race([writePromise, timeoutPromise]);
       setCopyFlash(true);
       setTimeout(() => setCopyFlash(false), 2000);
     } catch (e) {
@@ -877,7 +876,11 @@ function DailyCashReport() {
 
   const copyToClipboard = async (text) => {
     try {
-      await navigator.clipboard.writeText(text);
+      const writePromise = navigator.clipboard.writeText(text);
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("clipboard timeout")), 4000)
+      );
+      await Promise.race([writePromise, timeoutPromise]);
       return true;
     } catch (e) {
       try {
@@ -897,12 +900,93 @@ function DailyCashReport() {
     }
   };
 
+  // 当月1日〜今日までの「総売上・粗利」をタブ区切りで作る(スプレッドシートに範囲貼り付けできる形式)
+  // 過去1ヶ月分(MIGRATION_WINDOW_DAYS分)のうち、当月に該当する日だけを使う
+  const buildSheetPasteText = async (startDate, endDate) => {
+    const dateList = [];
+    let cursor = startDate;
+    while (cursor <= endDate) {
+      dateList.push(cursor);
+      cursor = offsetDateStr(cursor, 1);
+    }
+
+    const keys = dateList.map((ds) => `report:${ds}`);
+    let results = {};
+    try {
+      results = await storageGetMany(keys);
+    } catch (e) {
+      results = {};
+    }
+
+    const lines = [];
+    dateList.forEach((ds) => {
+      let t = 0;
+      let g = 0;
+      if (ds === date) {
+        // 選択範囲に本日が含まれる場合は、保存前でも今入力中の値を使う
+        t = totalSales;
+        g = num(grossProfit);
+      } else {
+        const r = results[`report:${ds}`];
+        if (r) {
+          try {
+            const rep = JSON.parse(r.value);
+            t = Number(rep.totalSales) || 0;
+            g = Number(rep.grossProfit) || 0;
+          } catch (e) {
+            // 壊れたデータは0扱い
+          }
+        }
+      }
+      lines.push(`${t}\t${g}`);
+    });
+
+    return { text: lines.join("\n"), count: dateList.length };
+  };
+
+  const copySheetPasteText = async () => {
+    setSheetPasteBusy(true);
+    setSheetPasteNotice("");
+    try {
+      if (sheetPasteStart > sheetPasteEnd) {
+        setSheetPasteNotice("開始日が終了日より後になっています。日付を確認してください。");
+        setSheetPasteBusy(false);
+        return;
+      }
+      const { text, count } = await buildSheetPasteText(sheetPasteStart, sheetPasteEnd);
+      setSheetPasteText(text);
+      const ok = await copyToClipboard(text);
+      if (ok) {
+        setSheetPasteFlash(true);
+        setSheetPasteNotice(
+          `${fmtDateJp(sheetPasteStart)}〜${fmtDateJp(sheetPasteEnd)}の${count}日分をコピーしました。スプレッドシートの該当する日の行・売上の列を選んで貼り付けてください。`
+        );
+        setTimeout(() => setSheetPasteFlash(false), 2500);
+      } else {
+        setSheetPasteNotice("コピーに失敗しました。下のテキストを長押しして手動でコピーしてください。");
+      }
+    } catch (e) {
+      setSheetPasteNotice("作成に失敗しました。もう一度お試しください。");
+    } finally {
+      setSheetPasteBusy(false);
+    }
+  };
+
   const buildMigrationPayload = async () => {
     const dateList = [];
     for (let i = 1; i <= MIGRATION_WINDOW_DAYS; i++) {
       dateList.push(dateStrDaysAgo(i));
     }
-    const keys = dateList.map((ds) => `report:${ds}`);
+
+    // まず実際に存在するキーだけを調べて、無駄な問い合わせを減らす(高速化)
+    const existingKeys = await storageListKeys("report:");
+    let targetDates = dateList;
+    if (existingKeys !== null) {
+      const existingSet = new Set(existingKeys);
+      targetDates = dateList.filter((ds) => existingSet.has(`report:${ds}`));
+    }
+
+    const keys = targetDates.map((ds) => `report:${ds}`);
     keys.push("app-state");
     let results = {};
     try {
@@ -912,7 +996,7 @@ function DailyCashReport() {
     }
 
     const historyReports = [];
-    dateList.forEach((ds) => {
+    targetDates.forEach((ds) => {
       const r = results[`report:${ds}`];
       if (!r) return;
       try {
@@ -959,14 +1043,14 @@ function DailyCashReport() {
     try {
       const payload = await buildMigrationPayload();
       const text = JSON.stringify(payload);
+      setExportedText(text);
       const ok = await copyToClipboard(text);
       if (ok) {
         setExportFlash(true);
-        setMigrationNotice(`過去${payload.historyReports.length}日分＋本日分のデータをコピーしました。`);
+        setMigrationNotice(`過去${payload.historyReports.length}日分＋本日分のデータをコピーしました。下に表示されている内容がコピーされています。`);
         setTimeout(() => setExportFlash(false), 2500);
       } else {
         setMigrationError("コピーに失敗しました。下のテキストを長押しして手動でコピーしてください。");
-        setImportText(text);
       }
     } catch (e) {
       setMigrationError("エクスポートに失敗しました。もう一度お試しください。");
@@ -1208,6 +1292,9 @@ function DailyCashReport() {
               <button style={styles.copyButton} onClick={exportMigrationData} disabled={migrationBusy}>
                 {migrationBusy ? "処理中..." : exportFlash ? "✓ コピーしました" : "① 今のデータをコピー(エクスポート)"}
               </button>
+              {exportedText && (
+                <pre style={styles.migrationExportPreview}>{exportedText}</pre>
+              )}
               <p style={{ ...styles.hint, marginTop: 14 }}>
                 新しいアプリ側では、コピーした内容を下に貼り付けて読み込んでください。
               </p>
@@ -1282,6 +1369,56 @@ function DailyCashReport() {
           <p style={styles.hint}>
             集計対象:今月の記録がある{monthlyPastDays}日分＋本日
           </p>
+        </Section>
+
+        {/* スプレッドシート貼り付け用 */}
+        <Section
+          title="スプレッドシート貼り付け用"
+          note="日付範囲を選んでコピー(過去30日以内)"
+        >
+          <button
+            style={styles.migrationToggle}
+            onClick={() => setShowSheetPaste((v) => !v)}
+          >
+            {showSheetPaste ? "閉じる" : "開く"}
+          </button>
+          {showSheetPaste && (
+            <div style={{ marginTop: 10 }}>
+              <p style={styles.hint}>
+                期間を選んで「コピー」を押すと、その範囲の「売上・粗利」がタブ区切りでコピーされます。スプレッドシート側で開始日の行・売上の列のセルを選んでから貼り付けると、売上列と粗利列にまとめて反映されます(月をまたぐ範囲は選ばないでください)。
+              </p>
+              <div style={styles.dateRangeRow}>
+                <input
+                  type="date"
+                  style={styles.dateInput}
+                  value={sheetPasteStart}
+                  min={offsetDateStr(todayStr(), -29)}
+                  max={sheetPasteEnd}
+                  onChange={(e) => {
+                    if (e.target.value) setSheetPasteStart(e.target.value);
+                  }}
+                />
+                <span style={styles.dateRangeTilde}>〜</span>
+                <input
+                  type="date"
+                  style={styles.dateInput}
+                  value={sheetPasteEnd}
+                  min={sheetPasteStart}
+                  max={todayStr()}
+                  onChange={(e) => {
+                    if (e.target.value) setSheetPasteEnd(e.target.value);
+                  }}
+                />
+              </div>
+              <button style={styles.copyButton} onClick={copySheetPasteText} disabled={sheetPasteBusy}>
+                {sheetPasteBusy ? "作成中..." : sheetPasteFlash ? "✓ コピーしました" : "コピー"}
+              </button>
+              {sheetPasteNotice && <p style={styles.ocrNotice}>{sheetPasteNotice}</p>}
+              {sheetPasteText && (
+                <pre style={styles.reportPreview}>{sheetPasteText}</pre>
+              )}
+            </div>
+          )}
         </Section>
 
         {/* レジ残り金 */}
@@ -1553,17 +1690,6 @@ function DailyCashReport() {
             {saving ? "保存中..." : "本日の報告を保存"}
           </button>
           {savedFlash && <span style={styles.savedFlash}>✓ 保存しました</span>}
-          {sheetSyncStatus === "sending" && (
-            <span style={styles.hint}>スプレッドシートに送信中...</span>
-          )}
-          {sheetSyncStatus === "success" && (
-            <span style={styles.savedFlash}>✓ スプレッドシートにも反映しました</span>
-          )}
-          {sheetSyncStatus === "error" && (
-            <span style={styles.hintWarn}>
-              スプレッドシートへの送信に失敗しました(アプリ側の保存は成功しています){sheetSyncError ? `: ${sheetSyncError}` : ""}
-            </span>
-          )}
         </div>
       </div>
     </div>
@@ -1671,6 +1797,16 @@ const styles = {
     padding: "8px 10px",
     fontSize: 14,
     background: "#fff",
+  },
+  dateRangeRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    margin: "10px 0",
+  },
+  dateRangeTilde: {
+    color: "#8a8272",
+    fontSize: 14,
   },
   todayBackButton: {
     padding: "8px 12px",
@@ -1987,9 +2123,24 @@ const styles = {
     boxSizing: "border-box",
     marginTop: 4,
   },
+  migrationExportPreview: {
+    width: "100%",
+    maxHeight: 160,
+    overflowY: "auto",
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-all",
+    background: "#faf7f0",
+    border: "1px solid #e4ddd0",
+    borderRadius: 8,
+    padding: "10px 12px",
+    fontSize: 11,
+    fontFamily: "monospace",
+    color: "#4a4438",
+    boxSizing: "border-box",
+    marginTop: 8,
+  },
 };
 
-// エラーバウンダリ: 予期しないエラーで画面が真っ白にならないようにする
 class ErrorBoundary extends React.Component {
   constructor(props) {
     super(props);
